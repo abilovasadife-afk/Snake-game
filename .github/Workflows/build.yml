@@ -1,0 +1,46 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+
+    - name: Setup MSYS2 (MinGW)
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        update: true
+        install: >-
+          mingw-w64-x86_64-gcc
+          mingw-w64-x86_64-sqlite3
+          mingw-w64-x86_64-cmake
+
+    - name: Compile Snake EXE
+      shell: msys2 {0}
+      run: |
+        cd $GITHUB_WORKSPACE
+        g++ -std=c++11 -O2 -static -static-libgcc -static-libstdc++ \
+            snake.cpp \
+            -o SnakeGame.exe \
+            -lwininet -lgdi32 -luser32 -ladvapi32 -lcrypt32 -lole32 -lshlwapi \
+            -lsqlite3 \
+            -mwindows
+
+    - name: List output
+      shell: msys2 {0}
+      run: ls -lh SnakeGame.exe
+
+    - name: Upload EXE artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: SnakeGame-Windows
+        path: SnakeGame.exe
+        retention-days: 30
